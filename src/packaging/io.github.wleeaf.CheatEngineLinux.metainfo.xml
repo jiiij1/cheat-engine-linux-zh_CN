@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.wleeaf.CheatEngineLinux</id>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Cheat Engine for Linux</name>
+  <summary>Memory scanner, debugger, and injector for modding games and apps</summary>
+  <summary xml:lang="zh_CN">用于游戏与应用修改的内存扫描、调试与注入工具</summary>
+  <developer id="io.github.wleeaf">
+    <name>wleeaf</name>
+  </developer>
+  <description>
+    <p>
+      A Linux-native reimplementation of Cheat Engine in C++ and Qt6: memory
+      scanning, pointer scanning, an auto-assembler, an interactive multi-thread
+      debugger, structure dissection, cheat tables, and Lua scripting.
+    </p>
+    <p>
+      Focused on single-player game modding and reverse engineering. It does not
+      target multiplayer anti-cheat.
+    </p>
+  </description>
+  <description xml:lang="zh_CN">
+    <p>
+      用 C++ 与 Qt6 实现的 Linux 原生 Cheat Engine：内存扫描、指针扫描、自动汇编、
+      交互式多线程调试器、结构剖析、作弊表以及 Lua 脚本。
+    </p>
+    <p>
+      面向单机游戏修改与逆向工程，不针对多人游戏反作弊。
+    </p>
+  </description>
+  <launchable type="desktop-id">cheatengine.desktop</launchable>
+  <provides>
+    <binary>cheatengine</binary>
+    <binary>cescan</binary>
+  </provides>
+  <categories>
+    <category>Development</category>
+    <category>Debugger</category>
+  </categories>
+  <url type="homepage">https://github.com/wleeaf/cheat-engine-linux</url>
+  <url type="bugtracker">https://github.com/wleeaf/cheat-engine-linux/issues</url>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.4.1" date="2026-07-13">
+      <description>
+        <p>Bug-fix release: light/dark theme applies live from Settings; the memory
+        browser explains ptrace-permission failures instead of showing a blank pane;
+        the .deb grants ptrace access automatically at install (setcap) and the
+        "process not readable" dialog offers a one-click pkexec grant; the AppImage
+        now bundles the Qt platform plugins and runs.</p>
+      </description>
+    </release>
+    <release version="0.4.0" date="2026-07-13">
+      <description>
+        <p>Full CLI / headless parity: every GUI tool is now scriptable from the
+        terminal through the Lua API and the cescan headless runner, so features are
+        testable without the GUI. New bindings for pointer scan, structure dissect,
+        managed-runtime detection, find-what-writes/accesses, break-and-trace, branch
+        mapper, register/stack read-write, find-statics, cheat-table save/load,
+        trainer generation, ceserver connect, and address-list grouping. Also fixes a
+        trainer code-generation bug (invalid float literal for whole-number values).</p>
+      </description>
+    </release>
+    <release version="0.3.0" date="2026-07-12">
+      <description>
+        <p>Complete interactive debugger (software + hardware breakpoints, register
+        editing, XMM, thread switcher, memory pane, scriptable Lua debugger); cecore
+        can act as a ceserver for remote memory access; untrusted cheat-table
+        security hardening.</p>
+      </description>
+    </release>
+    <release version="0.2.1" date="2026-07-10">
+      <description>
+        <p>AOB-injection fix, 32-bit/WoW64/Wine support, cheat-table inline editing.</p>
+      </description>
+    </release>
+  </releases>
+</component>

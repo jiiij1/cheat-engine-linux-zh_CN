@@ -1,0 +1,142 @@
+// Headless (offscreen Qt) smoke test for the Structure Dissector's compare mode
+// (CE Dissect Data side-by-side): two structs identical except at one offset must
+// produce one value column per instance, with the differing cell coloured and the
+// equal cells not. Reads this process's own memory, so no fork/ptrace is needed.
+// Exit 0 on success.
+
+#include "gui/structuredissector.hpp"
+#include "platform/linux/linux_process.hpp"
+
+#include <QApplication>
+#include <cstdio>
+#include <cstdint>
+#include <cstring>
+#include <unistd.h>
+
+static uint8_t g_a[64];
+static uint8_t g_b[64];
+
+int main(int argc, char** argv) {
+    qputenv("QT_QPA_PLATFORM", "offscreen");
+
+    // Two "structs" identical except for the int32 field at offset 0x10.
+    std::memset(g_a, 0, sizeof g_a);
+    std::memset(g_b, 0, sizeof g_b);
+    uint32_t va = 0x11111111u, vb = 0x22222222u;
+    std::memcpy(g_a + 16, &va, 4);
+    std::memcpy(g_b + 16, &vb, 4);
+    uint32_t equalField = 7;                 // offset 0x28: same in both
+    std::memcpy(g_a + 40, &equalField, 4);
+    std::memcpy(g_b + 40, &equalField, 4);
+    // Offset 0x20 (row 4) of g_a holds a valid pointer (to g_b) from the start, so the
+    // Pointer? column colours it teal (CE Dissect Data). Set before the first populate
+    // so the row isn't also flagged "changed" (change-red would win over pointer-teal).
+    uintptr_t pbInit = reinterpret_cast<uintptr_t>(g_b);
+    std::memcpy(g_a + 0x20, &pbInit, sizeof(pbInit));
+
+    QApplication app(argc, argv);
+    ce::os::LinuxProcessHandle proc(getpid());
+    ce::gui::StructureDissector diss(&proc, reinterpret_cast<uintptr_t>(g_a));
+    diss.resize(800, 600);
+    diss.show();
+    app.processEvents();
+
+    // Single-struct mode: a value that changes between refreshes is flagged (live-change
+    // highlight). Flip the field at offset 0x18 (row 3), refresh, and check only it lit.
+    g_a[24] ^= 0xFFu;
+    diss.refreshNowForTest();
+    bool changedRow3 = diss.rowValueChangedForTest(3);
+    bool changedRow0 = diss.rowValueChangedForTest(0);
+
+    // Pointer coloring (CE Dissect Data): a field holding a valid pointer paints teal in
+    // the Pointer? column. Offset 0x20 (row 4) holds &g_b; offset 0x00 (row 0) is zero.
+    bool ptrColored = diss.pointerColoredForTest(4);
+    bool ptrNotColored = !diss.pointerColoredForTest(0);
+    bool ptrColorOk = ptrColored && ptrNotColored;
+
+    // Enter compare mode against the second struct.
+    diss.setCompareAddressesForTest({ reinterpret_cast<uintptr_t>(g_b) });
+    app.processEvents();
+
+    int cols = diss.columnCountForTest();          // Offset, Name, Base, 0x<g_b>
+    bool diffAt0x10 = diss.cellDiffColoredForTest(2, 3);   // row 2 = offset 0x10 differs
+    bool sameAt0x00 = diss.cellDiffColoredForTest(0, 3);   // row 0 = offset 0x00 equal
+    bool sameAt0x28 = diss.cellDiffColoredForTest(5, 3);   // row 5 = offset 0x28 equal
+
+    // "Add All to List": name two fields and confirm both are pushed to the callback,
+    // and that a field's DECLARED type (Type-as) flows through instead of a guess.
+    int added = 0;
+    ce::ValueType ammoType = ce::ValueType::Int32;
+    bool ammoSeen = false;
+    diss.setAddToListCallback([&](uintptr_t, ce::ValueType t, const QString& name) {
+        ++added;
+        if (name == "ammo") { ammoType = t; ammoSeen = true; }
+    });
+    diss.nameFieldForTest(0, "health");
+    diss.nameFieldForTest(16, "ammo");
+    diss.typeFieldForTest(16, ce::ValueType::Float);   // declared Float (bytes guess as Int32)
+    int returned = diss.addAllFieldsToList();
+    bool addAllOk = (returned == 2 && added == 2 && ammoSeen && ammoType == ce::ValueType::Float);
+
+    // Single-field "Add (auto)" from the row context menu uses that field's declared
+    // type (Float) and name (ammo), matching Add All (not the byte guess / generic desc).
+    uintptr_t singleAddr = 0; ce::ValueType singleType = ce::ValueType::Int32; QString singleDesc;
+    diss.setAddToListCallback([&](uintptr_t a, ce::ValueType t, const QString& name) {
+        singleAddr = a; singleType = t; singleDesc = name;
+    });
+    diss.addFieldToListForTest(16);
+    bool singleAddOk = singleAddr == reinterpret_cast<uintptr_t>(g_a) + 16 &&
+                       singleType == ce::ValueType::Float && singleDesc == "ammo";
+
+    // Base Address field accepts CE-style expressions, not just bare hex: "#1234" is
+    // decimal, "0x.." is hex.
+    bool exprDecimal = diss.resolveBaseForTest("#256") == 256;
+    bool exprHex = diss.resolveBaseForTest("0x2000") == 0x2000;
+    // Compare addresses accept expressions too: two tokens (hex + #decimal) -> two columns
+    // (Offset, Name, Base + 2 = 5). Point the base back at real memory first, so
+    // populateTable actually rebuilds the columns (it bails on an unreadable base).
+    diss.resolveBaseForTest(QString("0x%1").arg(reinterpret_cast<uintptr_t>(g_a), 0, 16));
+    bool exprCompare = diss.setCompareExpressionForTest("0x3000, #16384") == 5;
+    bool exprOk = exprDecimal && exprHex && exprCompare;
+
+    // Follow-pointer: double-clicking a pointer field re-bases the dissector to the
+    // pointed-to struct (CE Dissect Data spider). Put a pointer to g_b at offset 0x20
+    // of g_a (row 4), point the base back at g_a, then follow it.
+    diss.resolveBaseForTest(QString("0x%1").arg(reinterpret_cast<uintptr_t>(g_a), 0, 16));
+    uintptr_t pb = reinterpret_cast<uintptr_t>(g_b);
+    std::memcpy(g_a + 0x20, &pb, sizeof(pb));
+    bool followed = diss.followPointerForTest(4 /*offset 0x20*/, 2 /*Base column*/);
+    bool followOk = followed && diss.baseAddressForTest() == reinterpret_cast<uintptr_t>(g_b);
+    // A non-pointer field (the int 7 at offset 0x28) must NOT follow.
+    diss.resolveBaseForTest(QString("0x%1").arg(reinterpret_cast<uintptr_t>(g_a), 0, 16));
+    bool noFollowInt = !diss.followPointerForTest(5 /*offset 0x28*/, 2);
+    bool followTestOk = followOk && noFollowInt;
+
+    // Save/load definition round-trip: a structure built in the UI (named + typed fields,
+    // as the "Name field..." / "Set field type" context actions now do) must persist. Save
+    // the current def (health@0, ammo@16:Float), clobber both fields, load it back, and
+    // confirm the field re-reports its saved name + type through the add-to-list path.
+    QString defPath = QString("/tmp/ce_structdef_%1.json").arg(getpid());
+    bool saved = diss.saveDefinitionForTest(defPath);
+    diss.nameFieldForTest(16, "wrong");
+    diss.typeFieldForTest(16, ce::ValueType::Int64);
+    bool loaded = diss.loadDefinitionForTest(defPath);
+    uintptr_t rtAddr = 0; ce::ValueType rtType = ce::ValueType::Int32; QString rtDesc;
+    diss.setAddToListCallback([&](uintptr_t a, ce::ValueType t, const QString& name) {
+        rtAddr = a; rtType = t; rtDesc = name;
+    });
+    diss.addFieldToListForTest(16);
+    bool defRoundTripOk = saved && loaded && rtType == ce::ValueType::Float && rtDesc == "ammo";
+    ::unlink(defPath.toLocal8Bit().constData());
+
+    bool ok = cols == 4 && diffAt0x10 && !sameAt0x00 && !sameAt0x28
+           && changedRow3 && !changedRow0 && ptrColorOk && addAllOk && singleAddOk && exprOk && followTestOk
+           && defRoundTripOk;
+    printf("gui structdissect smoke: %s (cols=%d diff@0x10=%d same@0x00=%d same@0x28=%d "
+           "changed@0x18=%d changed@0x00=%d ptrColor=%d addAll=%d singleAdd=%d expr=%d follow=%d noFollowInt=%d "
+           "defRoundTrip=%d)\n",
+           ok ? "OK" : "FAILED", cols, diffAt0x10, sameAt0x00, sameAt0x28, changedRow3, changedRow0,
+           (int)ptrColorOk, addAllOk, (int)singleAddOk, exprOk, (int)followOk, (int)noFollowInt,
+           (int)defRoundTripOk);
+    return ok ? 0 : 1;
+}

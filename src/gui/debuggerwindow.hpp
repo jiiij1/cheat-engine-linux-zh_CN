@@ -1,0 +1,193 @@
+#pragma once
+// Interactive step-debugger window: attach, software breakpoints, and
+// continue/step-into/over/out/run-to-cursor over a live (multi-threaded) target,
+// driven by ce::DebugSession (all-stop). Debug events fire on the tracer thread
+// and are marshalled to the UI thread via a queued invocation.
+
+#include "debug/debug_session.hpp"
+#include "arch/disassembler.hpp"
+#include "platform/process_api.hpp"
+#include "symbols/elf_symbols.hpp"
+#include <QMainWindow>
+#include <memory>
+#include <map>
+#include <vector>
+#include <array>
+#include <atomic>
+
+class QLineEdit;
+class QPlainTextEdit;
+class QTextEdit;
+class QTableWidget;
+class QTableWidgetItem;
+class QComboBox;
+class QLabel;
+class QListWidget;
+class QPushButton;
+
+namespace ce::gui {
+
+class DebuggerWindow : public QMainWindow {
+    Q_OBJECT
+public:
+    explicit DebuggerWindow(ce::ProcessHandle* proc, QWidget* parent = nullptr);
+    ~DebuggerWindow() override;
+
+    /// Plant a software breakpoint at `addr` (e.g. from the disassembler's
+    /// "set breakpoint" action). No-op if not attached.
+    void addBreakpointAt(uintptr_t addr, const QString& condition = QString());
+
+    // Accessors for automation/smoke tests.
+    bool debugAttached() const { return session_ && session_->isAttached(); }
+    bool debugStopped() const { return session_ && session_->isStopped(); }
+    uintptr_t currentStopRip() const { return lastStopRip_; }
+    /// Continue until execution reaches `addr` (a one-shot breakpoint), then stop.
+    /// Public so the Memory Viewer's "Run to cursor" can target its own selected line.
+    void runToAddress(uintptr_t addr);
+    uint64_t currentStopRflags() const { return lastStopRflags_; }
+    const ce::CpuContext& currentStopContext() const { return lastStopContext_; }
+    /// Numeric address -> user comment, so the paused disassembly shows the same inline
+    /// comments the Memory Viewer does. Set/refreshed by MainWindow from the annotations;
+    /// re-renders the disassembly immediately when stopped so a new comment shows at once.
+    void setComments(std::map<uintptr_t, std::string> comments);
+    // Type `value` into register row `row`'s cell exactly as the UI would (routes
+    // through onRegisterEdited -> setStopContext) and report whether the stopped
+    // thread's register now holds it. Row order matches the table:
+    // 0=RIP 1=RSP 2=RBP 3=RAX 4=RBX 5=RCX 6=RDX 7=RSI 8=RDI 9=RFLAGS.
+    bool pokeRegisterForTest(int row, uint64_t value);
+    // Thread switcher automation: number of threads in the dropdown, and a helper
+    // that picks a different one via the combo (as the user would) and reports
+    // whether the session's active thread followed.
+    int  threadCount() const;
+    bool switchToOtherThreadForTest();
+    // Point the memory/hex pane at `addr` and report whether it rendered the
+    // bytes actually there (verifies the pane against a fresh read).
+    bool memoryViewShowsForTest(uintptr_t addr);
+    // Bytes flagged changed in the memory pane since the previous dump (painted red).
+    int  memViewChangedByteCountForTest() const {
+        int c = 0; for (char x : memChanged_) if (x) ++c; return c;
+    }
+    // Dump `addr`, flip a byte in the target, re-dump, and report that exactly one byte
+    // lit up as changed (then restore it). Verifies the memory-pane change highlight.
+    bool memViewChangeHighlightForTest(uintptr_t addr);
+    // Whether the XMM0 register row displays a value whose low 64 bits are `lo`.
+    bool xmm0ShowsForTest(uint64_t lo);
+    // Move the caret to disasm line `lineIndex` and set a breakpoint there via the
+    // same path the right-click menu uses; report whether it was planted.
+    bool disasmSetBreakpointForTest(int lineIndex);
+    // Move the caret to disasm line `lineIndex`, toggle a breakpoint there twice via the
+    // F5 path, and report that the first toggle added it and the second removed it.
+    bool toggleBreakpointAtCursorForTest(int lineIndex);
+    // True if any GP register row currently paints in the "changed" (red) colour,
+    // i.e. the last stop's step highlight fired.
+    bool anyRegisterChangedHighlightForTest() const;
+    // The decoded-flags line shown under the register table (e.g. "Flags: PF ZF IF").
+    QString flagsTextForTest() const;
+    // The stack pane's current text (address: value [ module+offset ] per slot).
+    QString stackTextForTest() const;
+    // The disassembly pane's current text (with inline symbol annotations).
+    QString disasmTextForTest() const;
+    // True if the disassembly's current (=>) line carries the background highlight.
+    bool disasmCurrentLineHighlightedForTest() const;
+
+signals:
+    /// The target stopped at `rip` (breakpoint / step). Lets other views (e.g. open
+    /// Memory Viewers) highlight and follow the current instruction, like CE.
+    void stopped(uintptr_t rip);
+    /// The target resumed (continue / run-to-cursor): clear any current-instruction
+    /// highlight until the next stop.
+    void resumed();
+
+private slots:
+    void onContinue();
+    void onStepInto();
+    void onStepOver();
+    void onStepOut();
+    void onRunToCursor();
+    void onDetach();
+    void onAddBreakpoint();
+    void onAddDataBreakpoint();   // hardware watchpoint (break on write/access)
+    void onRemoveBreakpoint();
+    void onRegisterEdited(QTableWidgetItem* item);  // edit a GP register in place
+    void onThreadSelected(int index);               // switch the active thread
+    void onMemAddrEntered();                         // point the hex pane at an address
+    void onDisasmContextMenu(const QPoint& pos);     // right-click the disassembly
+    void onDebugEvent(int type);   // marshalled from the tracer thread
+
+private:
+    void refreshStopped();
+    void updateThreadList();   // repopulate the thread dropdown at a stop
+    void updateMemoryView(uintptr_t addr);   // hex-dump bytes at addr
+    void setBreakpointAtCursor();            // disasm menu action
+    void toggleBreakpointAtCursor();         // F5: add/remove a breakpoint at the cursor
+    void setConditionalBreakpointAtCursor(); // disasm menu action (prompts for expr)
+    void editBreakpointCondition();          // breakpoint-list action (edit condition)
+    void nopInstructionAtCursor();           // disasm menu action
+    void updateRegisters(const ce::CpuContext& ctx);
+    void updateDisassembly(const ce::CpuContext& ctx);
+    void updateStack(const ce::CpuContext& ctx);
+    void setRunningUi(bool running, bool exited = false);
+    uintptr_t currentCursorAddress() const;   // selected disasm line, else RIP
+
+    ce::ProcessHandle* proc_;
+    std::unique_ptr<ce::DebugSession> session_;
+    ce::Disassembler disasm_{ce::Arch::X86_64};
+
+    QLabel* statusLabel_ = nullptr;
+    QLabel* flagsLabel_ = nullptr;   // decoded CPU flags (CF PF ZF SF …) at the stop
+    std::vector<ce::ModuleInfo> modules_;   // for module+offset on stack return addresses
+    ce::SymbolResolver resolver_;           // function names for stack return addresses
+    bool symbolsLoaded_ = false;            // resolver_ populated lazily on the first stop
+    QPlainTextEdit* disasmView_ = nullptr;
+    QComboBox* threadCombo_ = nullptr;
+    QTableWidget* regTable_ = nullptr;
+    std::vector<uintptr_t> prevGp_;   // last stop's GP regs, to red-flag changes on step
+    std::array<std::array<uint8_t, 16>, 16> prevXmm_{};   // ditto for XMM0-15
+    QPlainTextEdit* stackView_ = nullptr;
+    QLineEdit* memAddrInput_ = nullptr;
+    QTextEdit* memView_ = nullptr;
+    std::vector<uint8_t> prevMem_;      // previous memory dump, for the change highlight
+    uintptr_t prevMemAddr_ = 0;         // address prevMem_ was read at
+    std::vector<char> memChanged_;      // per-byte: differs from the previous dump
+    uintptr_t lastMemAddr_ = 0;   // address the hex pane is following (0 = none)
+    QLineEdit* bpInput_ = nullptr;
+    QListWidget* bpList_ = nullptr;
+    QPushButton* contBtn_ = nullptr;
+    QPushButton* intoBtn_ = nullptr;
+    QPushButton* overBtn_ = nullptr;
+    QPushButton* outBtn_ = nullptr;
+    QPushButton* rtcBtn_ = nullptr;
+    QPushButton* detachBtn_ = nullptr;
+
+    struct Bp {
+        int id; uintptr_t addr; std::string condition;
+        bool hardware = false;   // true = hardware data watchpoint (DR0-3)
+        int hwType = 0;          // 1=write, 3=access (data breakpoints only)
+        int hwSize = 0;          // 1/2/4/8 bytes
+        int hitCount = 0;
+        bool enabled = true;
+        uint8_t origByte = 0;    // original code byte a software BP replaced with 0xCC
+        bool hasOrig = false;    // origByte was captured (so the disasm can un-mask it)
+    };
+    std::vector<Bp> bps_;
+    QString bpRowText(const Bp& b) const;      // list text incl. condition + hit count
+    void refreshBpRow(int index);              // rewrite one list row from bps_[index]
+    static QString bpLabel(uintptr_t addr, const QString& condition);   // execute-bp list text
+    static QString bpDataLabel(uintptr_t addr, int type, int size);     // data-bp list text
+    std::vector<uintptr_t> disasmLineAddrs_;   // address per rendered disasm line
+    uintptr_t lastStopRip_ = 0;
+    uint64_t lastStopRflags_ = 0;
+    ce::CpuContext lastStopContext_{};   // full registers at the stop (for operand EA hints)
+    std::map<uintptr_t, std::string> comments_;   // address -> user comment (from MainWindow)
+
+    // Latest event, published by the tracer-thread callback and read on the UI
+    // thread after a queued invocation.
+    std::atomic<uintptr_t> lastEvtAddr_{0};
+    std::atomic<pid_t> lastEvtTid_{0};
+    // Run-to-cursor is a GUI-level temp breakpoint + continue (non-blocking),
+    // auto-removed when its address is hit.
+    uintptr_t pendingRtcAddr_ = 0;
+    int pendingRtcId_ = -1;
+};
+
+} // namespace ce::gui

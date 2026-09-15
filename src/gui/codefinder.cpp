@@ -1,0 +1,306 @@
+#include "gui/codefinder.hpp"
+#include "debug/patch.hpp"
+#include <QVBoxLayout>
+#include <QHeaderView>
+#include <QFont>
+#include <QDialog>
+#include <QPlainTextEdit>
+#include <QPushButton>
+#include <QMessageBox>
+#include <QTextStream>
+#include <QFile>
+#include <QFileDialog>
+#include <QHBoxLayout>
+#include <QMenu>
+
+namespace ce::gui {
+
+static QString hexQ(uint64_t v) { return QString("0x%1").arg(v, 0, 16); }
+
+// Pointer-path hint: which register at the writing instruction holds the target
+// address (a direct pointer) or a base such that target == [reg + offset] -- the
+// struct base to pointer-scan for a stable address. Empty when no register lines up.
+static QString pointerHint(const ce::CpuContext& c, uintptr_t target) {
+    if (!target) return {};
+    const struct { const char* n; uint64_t v; } gp[] = {   // rsp excluded (stack is not a pointer path)
+        {"rax",c.rax},{"rbx",c.rbx},{"rcx",c.rcx},{"rdx",c.rdx},
+        {"rsi",c.rsi},{"rdi",c.rdi},{"rbp",c.rbp},
+        {"r8", c.r8}, {"r9", c.r9}, {"r10",c.r10},{"r11",c.r11},
+        {"r12",c.r12},{"r13",c.r13},{"r14",c.r14},{"r15",c.r15},
+    };
+    for (const auto& r : gp) if (r.v == target) return QObject::tr("%1 (direct)").arg(r.n);
+    for (const auto& r : gp)
+        if (r.v < target && target - r.v <= 0x1000)
+            return QString("[%1+0x%2]").arg(r.n).arg(target - r.v, 0, 16);
+    return {};
+}
+
+static QString fullRegisterDump(const ce::CpuContext& ctx) {
+    QString s;
+    s += QObject::tr("rax = %1   rbx = %2\n").arg(hexQ(ctx.rax), hexQ(ctx.rbx));
+    s += QObject::tr("rcx = %1   rdx = %2\n").arg(hexQ(ctx.rcx), hexQ(ctx.rdx));
+    s += QObject::tr("rsi = %1   rdi = %2\n").arg(hexQ(ctx.rsi), hexQ(ctx.rdi));
+    s += QObject::tr("rbp = %1   rsp = %2\n").arg(hexQ(ctx.rbp), hexQ(ctx.rsp));
+    s += QString("r8  = %1   r9  = %2\n").arg(hexQ(ctx.r8),  hexQ(ctx.r9));
+    s += QString("r10 = %1   r11 = %2\n").arg(hexQ(ctx.r10), hexQ(ctx.r11));
+    s += QString("r12 = %1   r13 = %2\n").arg(hexQ(ctx.r12), hexQ(ctx.r13));
+    s += QString("r14 = %1   r15 = %2\n").arg(hexQ(ctx.r14), hexQ(ctx.r15));
+    s += QObject::tr("rip = %1\n").arg(hexQ(ctx.rip));
+    s += QObject::tr("rflags = %1\n").arg(hexQ(ctx.rflags));
+    s += QObject::tr("cs=%1 ss=%2 ds=%3 es=%4 fs=%5 gs=%6\n")
+            .arg(hexQ(ctx.cs)).arg(hexQ(ctx.ss)).arg(hexQ(ctx.ds))
+            .arg(hexQ(ctx.es)).arg(hexQ(ctx.fs)).arg(hexQ(ctx.gs));
+    s += QObject::tr("dr0=%1 dr1=%2 dr2=%3 dr3=%4 dr6=%5 dr7=%6\n")
+            .arg(hexQ(ctx.dr0)).arg(hexQ(ctx.dr1)).arg(hexQ(ctx.dr2))
+            .arg(hexQ(ctx.dr3)).arg(hexQ(ctx.dr6)).arg(hexQ(ctx.dr7));
+    return s;
+}
+
+CodeFinderWindow::CodeFinderWindow(CodeFinder* finder, const QString& title,
+                                   ce::ProcessHandle* proc, QWidget* parent)
+    : QMainWindow(parent), finder_(finder), proc_(proc) {
+    // Load symbols once so exact-store recovery can anchor at the enclosing function.
+    if (proc_) symbols_.loadProcess(*proc_);
+    setWindowTitle(title);
+    resize(1100, 500);
+
+    auto* central = new QWidget;
+    auto* layout = new QVBoxLayout(central);
+
+    statusLabel_ = new QLabel(QObject::tr("Monitoring..."));
+    layout->addWidget(statusLabel_);
+
+    table_ = new QTableWidget;
+    table_->setColumnCount(9);
+    table_->setHorizontalHeaderLabels({QObject::tr("Address"), QObject::tr("Instruction"), QObject::tr("Hits"), QObject::tr("Pointer path"),
+                                       "RAX", "RBX", "RCX", "RDX", "RIP"});
+    table_->horizontalHeader()->setStretchLastSection(false);
+    // Fit the address, hit count and 64-bit register columns to content (they
+    // clipped at the 100px default); the disassembly text takes the slack.
+    for (int c = 0; c < 9; ++c)
+        table_->horizontalHeader()->setSectionResizeMode(c, QHeaderView::ResizeToContents);
+    table_->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
+    table_->setSelectionBehavior(QAbstractItemView::SelectRows);
+    table_->setFont(QFont("Monospace", 9));
+    table_->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    connect(table_, &QTableWidget::itemDoubleClicked, this, [this](QTableWidgetItem* item) {
+        if (!item) return;
+        int row = item->row();
+        auto results = finder_->results();
+        if (row < 0 || row >= (int)results.size()) return;
+
+        auto* dlg = new QDialog(this);
+        dlg->setWindowTitle(QObject::tr("Hit context @ 0x%1").arg(results[row].instructionAddress, 0, 16));
+        dlg->resize(520, 360);
+        auto* dlgLayout = new QVBoxLayout(dlg);
+        auto* hdr = new QLabel(QObject::tr("<b>%1</b>  hits=%2")
+            .arg(QString::fromStdString(results[row].instructionText))
+            .arg(results[row].hitCount));
+        dlgLayout->addWidget(hdr);
+
+        auto* firstLabel = new QLabel(QObject::tr("<b>First hit:</b>"));
+        dlgLayout->addWidget(firstLabel);
+        auto* firstDump = new QPlainTextEdit(fullRegisterDump(results[row].firstContext));
+        firstDump->setReadOnly(true);
+        firstDump->setFont(QFont("Monospace", 9));
+        dlgLayout->addWidget(firstDump);
+
+        auto* lastLabel = new QLabel(QObject::tr("<b>Last hit:</b>"));
+        dlgLayout->addWidget(lastLabel);
+        auto* lastDump = new QPlainTextEdit(fullRegisterDump(results[row].lastContext));
+        lastDump->setReadOnly(true);
+        lastDump->setFont(QFont("Monospace", 9));
+        dlgLayout->addWidget(lastDump);
+
+        auto* btn = new QPushButton(QObject::tr("Close"));
+        connect(btn, &QPushButton::clicked, dlg, &QDialog::accept);
+        dlgLayout->addWidget(btn);
+        dlg->exec();
+        dlg->deleteLater();
+    });
+    table_->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(table_, &QTableWidget::customContextMenuRequested,
+            this, &CodeFinderWindow::onContextMenu);
+    layout->addWidget(table_);
+
+    auto* btnRow = new QHBoxLayout;
+    stopBtn_ = new QPushButton(QObject::tr("Stop"));
+    connect(stopBtn_, &QPushButton::clicked, this, &CodeFinderWindow::onStop);
+    btnRow->addWidget(stopBtn_);
+    btnRow->addStretch();
+    auto* addBtn = new QPushButton(QObject::tr("Add to Address List"));
+    addBtn->setToolTip(QObject::tr("Add the selected instructions (or all, if none selected) to the address list."));
+    connect(addBtn, &QPushButton::clicked, this, &CodeFinderWindow::onAddToList);
+    btnRow->addWidget(addBtn);
+    saveBtn_ = new QPushButton(QObject::tr("Save to File..."));
+    saveBtn_->setToolTip(QObject::tr("Export the found instructions, hit counts, and registers to a text file."));
+    connect(saveBtn_, &QPushButton::clicked, this, &CodeFinderWindow::onExportToFile);
+    btnRow->addWidget(saveBtn_);
+    layout->addLayout(btnRow);
+
+    setCentralWidget(central);
+
+    refreshTimer_ = new QTimer(this);
+    connect(refreshTimer_, &QTimer::timeout, this, &CodeFinderWindow::refresh);
+    refreshTimer_->start(500);
+}
+
+void CodeFinderWindow::refresh() {
+    auto results = finder_->results();
+    statusLabel_->setText(finder_->running()
+        ? QObject::tr("Monitoring... %1 unique instructions found (double-click a row for full register state)").arg(results.size())
+        : QObject::tr("Stopped. %1 unique instructions found").arg(results.size()));
+
+    table_->setRowCount(results.size());
+    for (size_t i = 0; i < results.size(); ++i) {
+        auto& r = results[i];
+        const auto& c = r.lastContext;
+        QString ptr = pointerHint(c, finder_->targetAddress());
+        auto* ptrItem = new QTableWidgetItem(ptr);
+        if (!ptr.isEmpty())
+            ptrItem->setToolTip(QObject::tr("This instruction addresses the value via this register; "
+                                "pointer-scan the base for a stable address."));
+        // A hardware watchpoint traps one instruction past the store, so recover the
+        // exact writer from the trap rip (software page-guard already stops on it).
+        uintptr_t insAddr = r.instructionAddress;
+        QString insText = QString::fromStdString(r.instructionText);
+        if (proc_ && !finder_->softwareWatch()) {
+            auto rec = ce::recoverStoreInstruction(*proc_, symbols_, r.firstContext.rip,
+                                                   proc_->is64bit());
+            if (rec.ok) { insAddr = rec.address; insText = QString::fromStdString(rec.text); }
+        }
+        if (noppedOriginals_.count(insAddr)) insText = QObject::tr("[NOP] ") + insText;   // patched to NOPs
+        table_->setItem(i, 0, new QTableWidgetItem(hexQ(insAddr)));
+        table_->setItem(i, 1, new QTableWidgetItem(insText));
+        table_->setItem(i, 2, new QTableWidgetItem(QString::number(r.hitCount)));
+        table_->setItem(i, 3, ptrItem);
+        table_->setItem(i, 4, new QTableWidgetItem(hexQ(c.rax)));
+        table_->setItem(i, 5, new QTableWidgetItem(hexQ(c.rbx)));
+        table_->setItem(i, 6, new QTableWidgetItem(hexQ(c.rcx)));
+        table_->setItem(i, 7, new QTableWidgetItem(hexQ(c.rdx)));
+        table_->setItem(i, 8, new QTableWidgetItem(hexQ(c.rip)));
+    }
+}
+
+void CodeFinderWindow::onStop() {
+    finder_->stop();
+    stopBtn_->setEnabled(false);
+    statusLabel_->setText(QObject::tr("Stopped. %1 unique instructions found").arg(finder_->results().size()));
+}
+
+void CodeFinderWindow::onAddToList() {
+    if (!addToList_) return;
+    auto results = finder_->results();
+    // Use the selected rows, or all rows if the user selected none.
+    std::vector<int> rows;
+    for (const auto& idx : table_->selectionModel()->selectedRows())
+        rows.push_back(idx.row());
+    if (rows.empty())
+        for (int i = 0; i < (int)results.size(); ++i) rows.push_back(i);
+
+    int added = 0;
+    for (int row : rows) {
+        if (row < 0 || row >= (int)results.size()) continue;
+        const auto& r = results[row];
+        addToList_(r.instructionAddress, QString::fromStdString(r.instructionText));
+        ++added;
+    }
+    statusLabel_->setText(QObject::tr("Added %1 instruction(s) to the address list.").arg(added));
+}
+
+void CodeFinderWindow::onExportToFile() {
+    auto results = finder_->results();
+    QString path = QFileDialog::getSaveFileName(this, QObject::tr("Save findings"),
+        "code-finder.txt", QObject::tr("Text files (*.txt);;All files (*)"));
+    if (path.isEmpty()) return;
+    QFile f(path);
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        QMessageBox::warning(this, QObject::tr("Save failed"), f.errorString());
+        return;
+    }
+    QTextStream out(&f);
+    out << windowTitle() << "\n";
+    out << QObject::tr("%1 unique instruction(s)\n\n").arg(results.size());
+    for (const auto& r : results) {
+        out << QObject::tr("0x%1  hits=%2  %3\n")
+                   .arg(r.instructionAddress, 0, 16)
+                   .arg(r.hitCount)
+                   .arg(QString::fromStdString(r.instructionText));
+        const auto& c = r.firstContext;
+        out << QObject::tr("    rax=%1 rbx=%2 rcx=%3 rdx=%4 rsi=%5 rdi=%6 rip=%7\n")
+                   .arg(c.rax,0,16).arg(c.rbx,0,16).arg(c.rcx,0,16).arg(c.rdx,0,16)
+                   .arg(c.rsi,0,16).arg(c.rdi,0,16).arg(c.rip,0,16);
+    }
+    statusLabel_->setText(QObject::tr("Saved %1 instruction(s) to %2").arg(results.size()).arg(path));
+}
+
+uintptr_t CodeFinderWindow::addressOfRow(int row) const {
+    // Column 0 holds the (recovery-adjusted) instruction address exactly as shown, so
+    // NOP/show act on the real writing instruction, not the raw pre-recovery address.
+    auto* it = (row >= 0) ? table_->item(row, 0) : nullptr;
+    if (!it) return 0;
+    bool ok = false;
+    uintptr_t a = it->text().toULongLong(&ok, 0);   // "0x..." -> hex
+    return ok ? a : 0;
+}
+
+bool CodeFinderWindow::nopInstructionAt(uintptr_t addr) {
+    if (!proc_ || !addr) return false;
+    auto orig = ce::nopInstruction(*proc_, addr);   // returns the replaced bytes (empty on failure)
+    if (orig.empty()) return false;
+    noppedOriginals_.emplace(addr, std::move(orig));   // keep the original for Restore
+    return true;
+}
+
+bool CodeFinderWindow::restoreInstructionAt(uintptr_t addr) {
+    if (!proc_) return false;
+    auto it = noppedOriginals_.find(addr);
+    if (it == noppedOriginals_.end()) return false;
+    if (!ce::restoreBytes(*proc_, addr, it->second)) return false;
+    noppedOriginals_.erase(it);
+    return true;
+}
+
+void CodeFinderWindow::onContextMenu(const QPoint& pos) {
+    int row = table_->rowAt(pos.y());
+    if (row < 0) return;
+    uintptr_t addr = addressOfRow(row);
+    if (!addr) return;
+
+    const bool isNopped = noppedOriginals_.count(addr) > 0;
+    QMenu menu(this);
+    QAction* showAct = showInDisasm_ ? menu.addAction(QObject::tr("Show in the disassembler")) : nullptr;
+    QAction* nopAct  = proc_ && !isNopped
+                       ? menu.addAction(QObject::tr("Replace with code that does nothing (NOP)")) : nullptr;
+    QAction* restoreAct = proc_ && isNopped ? menu.addAction(QObject::tr("Restore with original code")) : nullptr;
+    QAction* addAct  = addToList_ ? menu.addAction(QObject::tr("Add to the address list")) : nullptr;
+    if (menu.isEmpty()) return;
+
+    QAction* picked = menu.exec(table_->viewport()->mapToGlobal(pos));
+    if (!picked) return;
+    if (picked == showAct) {
+        showInDisasm_(addr);
+    } else if (picked == nopAct) {
+        if (nopInstructionAt(addr)) {
+            if (auto* it = table_->item(row, 1))
+                it->setText(QObject::tr("[NOP] ") + it->text());
+            statusLabel_->setText(QObject::tr("Patched 0x%1 to NOPs.").arg(addr, 0, 16));
+        } else {
+            statusLabel_->setText(QObject::tr("Could not patch 0x%1.").arg(addr, 0, 16));
+        }
+    } else if (picked == restoreAct) {
+        if (restoreInstructionAt(addr)) {
+            if (auto* it = table_->item(row, 1)) {
+                QString t = it->text();
+                if (t.startsWith("[NOP] ")) it->setText(t.mid(6));
+            }
+            statusLabel_->setText(QObject::tr("Restored the original code at 0x%1.").arg(addr, 0, 16));
+        } else {
+            statusLabel_->setText(QObject::tr("Could not restore 0x%1.").arg(addr, 0, 16));
+        }
+    } else if (picked == addAct) {
+        onAddToList();
+    }
+}
+
+} // namespace ce::gui

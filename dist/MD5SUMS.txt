@@ -1,0 +1,3 @@
+ed0df84f34b84c5cce97569f3b9b1d65  dist/cheat-engine-linux_0.8.0_sandbox-injection-fix.patch
+d9579b7b634b26d8ff292ae8cc34343d  dist/cheat-engine-linux_0.8.0_zh-CN_amd64.deb
+035cff254c65c7ff45f9e5c8eb6142f6  dist/libcecore.so.0.8.0

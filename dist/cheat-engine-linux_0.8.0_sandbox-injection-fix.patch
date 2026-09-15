@@ -1,0 +1,385 @@
+--- a/platform/linux/ns_attach.cpp
++++ b/platform/linux/ns_attach.cpp
+@@ -1,5 +1,6 @@
+ #include "core/ns_attach.hpp"
+ 
++#include <sys/stat.h>
+ #include <unistd.h>
+ 
+ #include <cstdlib>
+@@ -17,13 +18,24 @@
+ std::string resolveProcPath(pid_t pid, const std::string& rawPath) {
+     if (rawPath.empty() || rawPath[0] != '/')
+         return rawPath;                       // [heap], [stack], anon, "" — nothing to open
+-    if (::access(rawPath.c_str(), F_OK) == 0)
+-        return rawPath;                       // openable from the host already (common case)
+-    // Try through the target's mount namespace root. Requires ptrace-level access to
+-    // traverse /proc/<pid>/root, which we hold when we can read the process at all.
++    // Same path, possibly a different file. A mount-namespace sandbox (Steam
++    // Linux Runtime / pressure-vessel, Flatpak, Snap, a chroot) overlays standard
++    // paths with its own tree, so /usr/lib/x86_64-linux-gnu/libc.so.6 exists on
++    // both sides but is NOT the same file. Existence alone therefore cannot tell
++    // which one the target is really running: reading our copy would hand back
++    // symbol addresses that are wrong for the target (a wrong dlopen offset, a
++    // call into the middle of an unrelated function, ...). Compare the file the
++    // target sees (st_dev/st_ino) and prefer it whenever the two differ.
+     std::string viaRoot = "/proc/" + std::to_string(pid) + "/root" + rawPath;
+-    if (::access(viaRoot.c_str(), F_OK) == 0)
+-        return viaRoot;
++    struct stat here {}, there {};
++    const bool hereExists = ::stat(rawPath.c_str(), &here) == 0;
++    const bool thereExists = ::stat(viaRoot.c_str(), &there) == 0;
++    if (thereExists && (!hereExists || here.st_dev != there.st_dev || here.st_ino != there.st_ino))
++        return viaRoot;                       // same path here, different file there
++    if (hereExists)
++        return rawPath;                       // openable from the host already (common case)
++    if (thereExists)
++        return viaRoot;                       // exists only inside the target's namespace
+     return rawPath;                           // neither exists; fail as before
+ }
+ 
+--- a/platform/linux/injector.cpp
++++ b/platform/linux/injector.cpp
+@@ -1,5 +1,6 @@
+ #include <fstream>
+ #include <dirent.h>
++#include <unistd.h>
+ #include "platform/linux/injector.hpp"
+ 
+ #include <sys/ptrace.h>
+@@ -15,6 +16,47 @@
+ 
+ namespace ce::os {
+ 
++// ── The path the TARGET's dynamic linker will actually open ──
++// dlopen() resolves its argument inside the target's mount namespace, so a path
++// that exists here can be missing (or be a different file) in there: the Steam
++// Linux Runtime (pressure-vessel) and Flatpak shadow /usr with their own tree,
++// where e.g. /usr/bin/libspeedhack.so simply does not exist even though it does
++// outside. Both mount the host filesystem at /run/host, so that is the first
++// fallback; a chroot-style sandbox is reachable through the tracer's own root
++// (/proc/<tracer>/root), which the target can follow when it may ptrace us.
++//
++// The visibility test below is only a filter to avoid pointless retries — it
++// cannot prove the target may traverse the path (the tracer's /proc/<pid>/root
++// is refused to a target in a child user namespace). That is why the injector
++// tries the candidates for real, in order, and keeps the first one that gets
++// the library mapped.
++static bool pathVisibleToTarget(pid_t pid, const std::string& path) {
++    if (path.empty() || path.size() >= 4096) return false;
++    return ::access(("/proc/" + std::to_string(pid) + "/root" + path).c_str(), F_OK) == 0;
++}
++
++static std::vector<std::string> injectPathCandidates(pid_t pid, const std::string& soPath) {
++    std::vector<std::string> candidates{soPath};
++    if (pathVisibleToTarget(pid, soPath))
++        return candidates;   // common case: the target sees the path exactly as we do
++    std::string hostMount = "/run/host" + soPath;
++    std::string viaTracerRoot = "/proc/" + std::to_string(::getpid()) + "/root" + soPath;
++    for (const std::string& alt : {hostMount, viaTracerRoot})
++        if (alt != soPath && pathVisibleToTarget(pid, alt))
++            candidates.push_back(alt);
++    return candidates;
++}
++
++// Is a module whose basename is `base` mapped in the target? Used to verify an
++// injection actually took effect (a non-NULL dlopen return is not proof).
++static bool libraryMappedInTarget(pid_t pid, const std::string& base) {
++    std::ifstream maps("/proc/" + std::to_string(pid) + "/maps");
++    std::string line;
++    while (std::getline(maps, line))
++        if (line.find(base) != std::string::npos) return true;
++    return false;
++}
++
+ // Stop a thread for hijacking via PTRACE_SEIZE + PTRACE_INTERRUPT rather than
+ // PTRACE_ATTACH's SIGSTOP. SEIZE gives a clean ptrace-stop that preserves an
+ // interrupted syscall's restart state, so hijacking a thread parked in a syscall
+@@ -307,53 +349,65 @@
+         for (pid_t t : siblings.tids)
+             if (inUserspace(t)) { injPid = t; break; }
+ 
+-    size_t pathLen = soPath.size() + 1;
+-    size_t allocSize = (pathLen + 4095) & ~static_cast<size_t>(4095);
+-
+-    int64_t raw = remoteSyscall32(injPid, NR32_MMAP2,
+-        0, (uint32_t)allocSize, 3 /*R|W*/, 0x22 /*PRIVATE|ANON*/, (uint32_t)-1, 0);
+-    uint32_t remoteMem = (uint32_t)raw;
+-    // mmap2 reports errors as -errno in eax (0xFFFFF001..0xFFFFFFFF once masked).
+-    if ((uint32_t)raw >= 0xFFFFF001u || remoteMem == 0) {
+-        ptrace(PTRACE_DETACH, pid, nullptr, nullptr);
+-        return std::unexpected("Failed to allocate memory in target (32-bit)");
+-    }
++    // Try each path the target might be able to open; keep the first that really
++    // maps the library (see injectPathCandidates).
++    std::string lastError = "dlopen failed for " + soPath;
++    for (const std::string& path : injectPathCandidates(pid, soPath)) {
++        size_t pathLen = path.size() + 1;
++        size_t allocSize = (pathLen + 4095) & ~static_cast<size_t>(4095);
++
++        int64_t raw = remoteSyscall32(injPid, NR32_MMAP2,
++            0, (uint32_t)allocSize, 3 /*R|W*/, 0x22 /*PRIVATE|ANON*/, (uint32_t)-1, 0);
++        uint32_t remoteMem = (uint32_t)raw;
++        // mmap2 reports errors as -errno in eax (0xFFFFF001..0xFFFFFFFF once masked).
++        if ((uint32_t)raw >= 0xFFFFF001u || remoteMem == 0) {
++            lastError = "Failed to allocate memory in target (32-bit)";
++            break;   // the attach is fine, so retrying another path cannot help
++        }
+ 
+-    const char* pathStr = soPath.c_str();
+-    for (size_t i = 0; i < pathLen; i += sizeof(long)) {
+-        long word = 0;
+-        memcpy(&word, pathStr + i, std::min(sizeof(long), pathLen - i));
+-        if (ptrace(PTRACE_POKETEXT, injPid, (void*)(uintptr_t)(remoteMem + i), (void*)word) < 0) {
++        const char* pathStr = path.c_str();
++        bool wrote = true;
++        for (size_t i = 0; i < pathLen; i += sizeof(long)) {
++            long word = 0;
++            memcpy(&word, pathStr + i, std::min(sizeof(long), pathLen - i));
++            if (ptrace(PTRACE_POKETEXT, injPid, (void*)(uintptr_t)(remoteMem + i), (void*)word) < 0) {
++                wrote = false;
++                break;
++            }
++        }
++        if (!wrote) {
+             remoteSyscall32(injPid, NR32_MUNMAP, remoteMem, (uint32_t)allocSize, 0, 0, 0, 0);
+-            ptrace(PTRACE_DETACH, pid, nullptr, nullptr);
+-            return std::unexpected("Failed to write library path into target");
++            lastError = "Failed to write library path into target";
++            break;
+         }
+-    }
+-
+-    constexpr uint32_t RTLD_NOW = 0x2;
+-    constexpr uint32_t RTLD_DLOPEN = 0x80000000u;
+-    uint32_t flags = usingLibcDlopen ? (RTLD_NOW | RTLD_DLOPEN) : RTLD_NOW;
+-    uint64_t handle = remoteCall32(injPid, (uint32_t)dlopenAddr, remoteMem, flags);
+ 
+-    remoteSyscall32(injPid, NR32_MUNMAP, remoteMem, (uint32_t)allocSize, 0, 0, 0, 0);
+-    ptrace(PTRACE_DETACH, pid, nullptr, nullptr);
+-
+-    if ((uint32_t)handle == 0 || handle == (uint64_t)-1)
+-        return std::unexpected("dlopen returned NULL in target process");
++        constexpr uint32_t RTLD_NOW = 0x2;
++        constexpr uint32_t RTLD_DLOPEN = 0x80000000u;
++        uint32_t flags = usingLibcDlopen ? (RTLD_NOW | RTLD_DLOPEN) : RTLD_NOW;
++        uint64_t handle = remoteCall32(injPid, (uint32_t)dlopenAddr, remoteMem, flags);
++
++        remoteSyscall32(injPid, NR32_MUNMAP, remoteMem, (uint32_t)allocSize, 0, 0, 0, 0);
++
++        std::string base = path.substr(path.find_last_of('/') + 1);
++        if ((uint32_t)handle == 0 || handle == (uint64_t)-1) {
++            lastError = "dlopen(\"" + path + "\") returned " +
++                        ((uint32_t)handle == 0 ? std::string("NULL")
++                                              : std::to_string((uint32_t)handle)) +
++                        " in target process";
++            continue;
++        }
++        if (!libraryMappedInTarget(pid, base)) {
++            lastError = "dlopen returned " + std::to_string((uint32_t)handle) +
++                        " but " + base + " is not mapped in the target";
++            continue;
++        }
+ 
+-    {
+-        std::string base = soPath.substr(soPath.find_last_of('/') + 1);
+-        std::ifstream maps("/proc/" + std::to_string(pid) + "/maps");
+-        std::string line;
+-        bool mapped = false;
+-        while (std::getline(maps, line))
+-            if (line.find(base) != std::string::npos) { mapped = true; break; }
+-        if (!mapped)
+-            return std::unexpected("dlopen returned " + std::to_string((uint32_t)handle) +
+-                                   " but " + base + " is not mapped in the target");
++        ptrace(PTRACE_DETACH, pid, nullptr, nullptr);
++        return (uintptr_t)(uint32_t)handle;
+     }
+ 
+-    return (uintptr_t)(uint32_t)handle;
++    ptrace(PTRACE_DETACH, pid, nullptr, nullptr);
++    return std::unexpected(lastError);
+ }
+ 
+ std::expected<uintptr_t, std::string>
+@@ -427,66 +481,76 @@
+         }
+     }
+ 
+-    // Allocate memory in target for the path string
+-    size_t pathLen = soPath.size() + 1;
+-    size_t allocSize = (pathLen + 4095) & ~4095; // Page-aligned
+-
+-    int64_t remoteMem = remoteSyscall(injPid, NR_MMAP,
+-        0, allocSize, 3 /*PROT_READ|PROT_WRITE*/, 0x22 /*MAP_PRIVATE|MAP_ANONYMOUS*/, -1, 0);
+-
+-    if (remoteMem <= 0 || remoteMem == -1) {
+-        ptrace(PTRACE_DETACH, pid, nullptr, nullptr);
+-        return std::unexpected("Failed to allocate memory in target");
+-    }
++    // Try each path the target might be able to open; keep the first that really
++    // maps the library (see injectPathCandidates).
++    std::string lastError = "dlopen failed for " + soPath;
++    for (const std::string& path : injectPathCandidates(pid, soPath)) {
++        // Allocate memory in target for the path string
++        size_t pathLen = path.size() + 1;
++        size_t allocSize = (pathLen + 4095) & ~4095; // Page-aligned
++
++        int64_t remoteMem = remoteSyscall(injPid, NR_MMAP,
++            0, allocSize, 3 /*PROT_READ|PROT_WRITE*/, 0x22 /*MAP_PRIVATE|MAP_ANONYMOUS*/, -1, 0);
++
++        if (remoteMem <= 0 || remoteMem == -1) {
++            lastError = "Failed to allocate memory in target";
++            break;   // the attach is fine, so retrying another path cannot help
++        }
+ 
+-    // Write the path string
+-    const char* pathStr = soPath.c_str();
+-    for (size_t i = 0; i < pathLen; i += sizeof(long)) {
+-        long word = 0;
+-        memcpy(&word, pathStr + i, std::min(sizeof(long), pathLen - i));
+-        if (ptrace(PTRACE_POKETEXT, injPid, (void*)(remoteMem + i), (void*)word) < 0) {
+-            // Don't call dlopen on a partially-written path; free and bail.
++        // Write the path string
++        const char* pathStr = path.c_str();
++        bool wrote = true;
++        for (size_t i = 0; i < pathLen; i += sizeof(long)) {
++            long word = 0;
++            memcpy(&word, pathStr + i, std::min(sizeof(long), pathLen - i));
++            if (ptrace(PTRACE_POKETEXT, injPid, (void*)(remoteMem + i), (void*)word) < 0) {
++                // Don't call dlopen on a partially-written path; free and bail.
++                wrote = false;
++                break;
++            }
++        }
++        if (!wrote) {
+             remoteSyscall(injPid, NR_MUNMAP, remoteMem, allocSize, 0, 0, 0, 0);
+-            ptrace(PTRACE_DETACH, pid, nullptr, nullptr);
+-            return std::unexpected("Failed to write library path into target");
++            lastError = "Failed to write library path into target";
++            break;
+         }
+-    }
+ 
+-    // Call dlopen(path, flags). RTLD_NOW=2; __libc_dlopen_mode additionally needs
+-    // the private __RTLD_DLOPEN bit (0x80000000) or it does not behave as a real
+-    // dlopen (and returns a bogus handle without mapping the library).
+-    constexpr uint64_t RTLD_NOW = 0x2;
+-    constexpr uint64_t RTLD_DLOPEN = 0x80000000UL;
+-    uint64_t flags = usingLibcDlopen ? (RTLD_NOW | RTLD_DLOPEN) : RTLD_NOW;
+-    uint64_t handle = remoteCall(injPid, dlopenAddr, remoteMem, flags);
+-
+-    // Free the path memory
+-    remoteSyscall(injPid, NR_MUNMAP, remoteMem, allocSize, 0, 0, 0, 0);
+-
+-    // Detach
+-    ptrace(PTRACE_DETACH, pid, nullptr, nullptr);
+-
+-    if (handle == 0 || handle == (uint64_t)-1)
+-        return std::unexpected("dlopen returned NULL in target process");
++        // Call dlopen(path, flags). RTLD_NOW=2; __libc_dlopen_mode additionally needs
++        // the private __RTLD_DLOPEN bit (0x80000000) or it does not behave as a real
++        // dlopen (and returns a bogus handle without mapping the library).
++        constexpr uint64_t RTLD_NOW = 0x2;
++        constexpr uint64_t RTLD_DLOPEN = 0x80000000UL;
++        uint64_t flags = usingLibcDlopen ? (RTLD_NOW | RTLD_DLOPEN) : RTLD_NOW;
++        uint64_t handle = remoteCall(injPid, dlopenAddr, remoteMem, flags);
++
++        // Free the path memory
++        remoteSyscall(injPid, NR_MUNMAP, remoteMem, allocSize, 0, 0, 0, 0);
++
++        // Verify the library is actually mapped now — a non-NULL return alone is not
++        // proof (a mis-flagged call can hand back a bogus small value). Confirm the
++        // basename appears in the target's /proc/<pid>/maps; that also makes this
++        // path the one the target could really see, so a path the sandbox hides is
++        // simply dropped and the next candidate is tried.
++        std::string base = path.substr(path.find_last_of('/') + 1);
++        if (handle == 0 || handle == (uint64_t)-1) {
++            lastError = "dlopen(\"" + path + "\") returned " +
++                        (handle == 0 ? std::string("NULL") : std::to_string(handle)) +
++                        " in target process";
++            continue;
++        }
++        if (!libraryMappedInTarget(pid, base)) {
++            lastError = "dlopen returned " + std::to_string(handle) +
++                        " but " + base + " is not mapped in the target";
++            continue;
++        }
+ 
+-    // Verify the library is actually mapped now — a non-NULL return alone is not
+-    // proof (a mis-flagged call can hand back a bogus small value). Confirm the
+-    // basename appears in the target's /proc/<pid>/maps.
+-    {
+-        std::string base = soPath.substr(soPath.find_last_of('/') + 1);
+-        std::string mapsPath = "/proc/" + std::to_string(pid) + "/maps";
+-        std::ifstream maps(mapsPath);
+-        std::string line;
+-        bool mapped = false;
+-        while (std::getline(maps, line)) {
+-            if (line.find(base) != std::string::npos) { mapped = true; break; }
+-        }
+-        if (!mapped)
+-            return std::unexpected("dlopen returned " + std::to_string(handle) +
+-                                   " but " + base + " is not mapped in the target");
++        // Detach
++        ptrace(PTRACE_DETACH, pid, nullptr, nullptr);
++        return (uintptr_t)handle;
+     }
+ 
+-    return (uintptr_t)handle;
++    ptrace(PTRACE_DETACH, pid, nullptr, nullptr);
++    return std::unexpected(lastError);
+ }
+ 
+ std::expected<RemoteThreadInfo, std::string>
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -43,6 +43,22 @@
+   `libspeedhack.so` next to the binaries and the Mono agent in the lib dir; the AppImage script
+   copies the speedhack library into `AppDir/usr/bin/` for the same reason (linuxdeploy cannot
+   see a library that is only dlopen'd).
++- **Fixed: "Apply" in the Speedhack dialog failed on a sandboxed target (Steam Linux Runtime /
++  pressure-vessel, Flatpak) with *"dlopen returned 18446744073709551104 but libspeedhack.so is
++  not mapped in the target"*.** Two independent bugs, both invisible outside a mount-namespace
++  sandbox:
++  - `ce::resolveProcPath` treated "this path exists on the host too" as "the same file". A
++    sandbox *overlays* standard paths with its own tree, so the target's
++    `/usr/lib/x86_64-linux-gnu/libc.so.6` was parsed from the **host's** copy: every symbol
++    offset was wrong for the target (`dlopen` resolved to `pthread_rwlock_rdlock+0x10` on a
++    Proton game), the injected call returned garbage (hence the `18446744073709551104` =
++    `-512` handle) and no library was ever mapped. Paths are now compared by `st_dev`/`st_ino`
++    and the file the target really sees (`/proc/<pid>/root<path>`) wins whenever the two differ.
++  - The library path is opened by the **target's** dynamic linker, so `/usr/bin/libspeedhack.so`
++    — shadowed inside a pressure-vessel container by the runtime's own `/usr` — was ENOENT
++    there. `injectLibrary` now tries the path as-is, through the host mount the sandbox exposes
++    (`/run/host`, used by Steam's runtime and Flatpak) and through the tracer's own root, and
++    keeps the first candidate that actually gets the library mapped.
+ 
+ ---
+ 
+--- a/docs/CHALLENGING_TARGETS.md
++++ b/docs/CHALLENGING_TARGETS.md
+@@ -61,11 +61,19 @@
+ containers, multi-process browsers.
+ Shipped: `core/ns_attach.hpp` (`resolveProcPath`/`nsInnerPid`/`isPidNamespaced`).
+ `LinuxProcessHandle::modules()` now redirects each module's backing-file path through
+-`/proc/<pid>/root` when it exists only inside the target's mount namespace, so symbol
+-loading and module analysis work on sandboxed targets (`process_vm_readv` already
+-worked; the files did not open). IL2CPP discovery resolves file-backed *region* paths
+-too, so `global-metadata.dat` (a data file, not a module) opens on Flatpak/Steam-Proton
+-(pressure-vessel) Unity games. `TargetProfile` reports the inner-namespace pid.
++`/proc/<pid>/root` when the target's file differs from ours — a path that merely
++*exists* on both sides is not the same file (a sandbox overlays `/usr` with its own
++tree, e.g. the Steam Runtime's `libc.so.6`), so the comparison is `st_dev`/`st_ino`
++and symbol loading reads the copy the target is actually running. Likewise,
++injecting a `.so` needs the path to be openable by the **target's** linker:
++`ce::os::injectLibrary` retries the raw path, `/run/host<path>` (the host mount
++Steam's runtime and Flatpak expose inside the sandbox) and the tracer's root, and
++keeps the first that really maps the library — without that, "Apply" in the
++Speedhack dialog failed with *"dlopen returned … but libspeedhack.so is not mapped
++in the target"* on every pressure-vessel game. IL2CPP discovery resolves file-backed
++*region* paths too, so `global-metadata.dat` (a data file, not a module) opens on
++Flatpak/Steam-Proton (pressure-vessel) Unity games. `TargetProfile` reports the
++inner-namespace pid.
+ The process picker badges sandboxed processes ([sandboxed] tag + tooltip, filterable)
+ via `ProcessInfo::sandboxed`. Validated against real private-mount-namespace processes
+ and a live Flatpak app. Remaining: `setns` for the rare targets where cross-namespace

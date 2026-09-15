@@ -1,0 +1,231 @@
+#include "arch/disassembler.hpp"
+#include <capstone/capstone.h>
+#include <stdexcept>
+#include <format>
+#include <cstdio>
+#include <unordered_map>
+
+namespace ce {
+
+std::string Instruction::toString() const {
+    std::string hex;
+    for (auto b : bytes)
+        hex += std::format("{:02x} ", b);
+    return std::format("{:016x}  {:<24s} {} {}", address, hex, mnemonic, operands);
+}
+
+Disassembler::Disassembler(Arch arch) : arch_(arch) {
+    cs_arch cs_a;
+    cs_mode cs_m;
+
+    switch (arch) {
+        case Arch::X86_32: cs_a = CS_ARCH_X86; cs_m = CS_MODE_32; break;
+        case Arch::X86_64: cs_a = CS_ARCH_X86; cs_m = CS_MODE_64; break;
+        case Arch::ARM32:  cs_a = CS_ARCH_ARM; cs_m = CS_MODE_ARM; break;
+        case Arch::ARM64:  cs_a = CS_ARCH_ARM64; cs_m = CS_MODE_ARM; break;
+    }
+
+    csh h;
+    if (cs_open(cs_a, cs_m, &h) != CS_ERR_OK)
+        throw std::runtime_error("Failed to initialize Capstone");
+
+    cs_option(h, CS_OPT_DETAIL, CS_OPT_ON);
+    handle_ = h;
+}
+
+Disassembler::~Disassembler() {
+    if (handle_)
+        cs_close(reinterpret_cast<csh*>(&handle_));
+}
+
+void Disassembler::setArch(Arch arch) {
+    if (arch == arch_ && handle_) return;
+    if (handle_) {
+        cs_close(reinterpret_cast<csh*>(&handle_));
+        handle_ = 0;
+    }
+    arch_ = arch;
+    cs_arch cs_a;
+    cs_mode cs_m;
+    switch (arch) {
+        case Arch::X86_32: cs_a = CS_ARCH_X86; cs_m = CS_MODE_32; break;
+        case Arch::X86_64: cs_a = CS_ARCH_X86; cs_m = CS_MODE_64; break;
+        case Arch::ARM32:  cs_a = CS_ARCH_ARM; cs_m = CS_MODE_ARM; break;
+        case Arch::ARM64:  cs_a = CS_ARCH_ARM64; cs_m = CS_MODE_ARM; break;
+    }
+    csh h;
+    if (cs_open(cs_a, cs_m, &h) != CS_ERR_OK)
+        throw std::runtime_error("Failed to initialize Capstone");
+    cs_option(h, CS_OPT_DETAIL, CS_OPT_ON);
+    handle_ = h;
+}
+
+// Rewrite a RIP-relative memory operand ("[rip + 0x1234]") to its resolved
+// absolute address ("[0x...]"), the way Cheat Engine displays it — much more
+// useful than Capstone's raw rip-relative form. Requires CS_OPT_DETAIL (on).
+static uintptr_t resolveRipRelative(const cs_insn& in, std::string& ops) {
+    if (!in.detail) return 0;
+    const cs_x86& x86 = in.detail->x86;
+    for (int k = 0; k < x86.op_count; ++k) {
+        const cs_x86_op& op = x86.operands[k];
+        if (op.type != X86_OP_MEM || op.mem.base != X86_REG_RIP || op.mem.index != X86_REG_INVALID)
+            continue;
+        uintptr_t abs = in.address + in.size + static_cast<int64_t>(op.mem.disp);
+        auto b = ops.find("[rip");
+        if (b == std::string::npos) return abs;  // target known even if text unexpected
+        auto e = ops.find(']', b);
+        if (e == std::string::npos) return abs;
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "[0x%llx]", static_cast<unsigned long long>(abs));
+        ops.replace(b, e - b + 1, buf);
+        return abs;
+    }
+    return 0;
+}
+
+// Decode the first x86 memory operand (base/index/scale/disp) so a consumer can
+// later compute the absolute address it touches from live registers. Follows the
+// same x86-detail assumption as resolveRipRelative above.
+static MemoryOperand extractMemoryOperand(const cs_insn& in, csh handle) {
+    MemoryOperand m;
+    if (!in.detail) return m;
+    const cs_x86& x86 = in.detail->x86;
+    for (int k = 0; k < x86.op_count; ++k) {
+        const cs_x86_op& op = x86.operands[k];
+        if (op.type != X86_OP_MEM) continue;
+        m.present = true;
+        m.disp  = static_cast<int64_t>(op.mem.disp);
+        m.scale = op.mem.scale ? op.mem.scale : 1;
+        if (op.mem.base == X86_REG_RIP) {
+            m.ripRelative = true;
+        } else if (op.mem.base != X86_REG_INVALID) {
+            if (const char* n = cs_reg_name(handle, op.mem.base)) m.baseReg = n;
+        }
+        if (op.mem.index != X86_REG_INVALID) {
+            if (const char* n = cs_reg_name(handle, op.mem.index)) m.indexReg = n;
+        }
+        break; // first memory operand only
+    }
+    return m;
+}
+
+static Instruction buildInstruction(const cs_insn& in, csh handle, Arch arch) {
+    Instruction inst;
+    inst.address = in.address;
+    inst.size = in.size;
+    inst.mnemonic = in.mnemonic;
+    inst.operands = in.op_str;
+    inst.bytes.assign(in.bytes, in.bytes + in.size);
+    // The cs_insn detail is an arch-specific union; reading its x86 members for an
+    // ARM instruction is undefined behavior (UBSan flags the garbage op_type). The
+    // memory-operand analysis is x86-only, so guard it by arch.
+    if (arch == Arch::X86_32 || arch == Arch::X86_64) {
+        inst.ripTarget = resolveRipRelative(in, inst.operands);
+        inst.memory = extractMemoryOperand(in, handle);
+        if (in.detail) {
+            const cs_x86_encoding& enc = in.detail->x86.encoding;
+            inst.dispOffset = enc.disp_offset; inst.dispSize = enc.disp_size;
+            inst.immOffset  = enc.imm_offset;  inst.immSize  = enc.imm_size;
+        }
+    }
+    return inst;
+}
+
+std::vector<Instruction> Disassembler::disassemble(uintptr_t address, std::span<const uint8_t> code,
+                                                   size_t count, bool emitDataBytes) {
+    std::vector<Instruction> result;
+    size_t offset = 0;
+
+    // Ensure a Capstone-allocated insn array is freed on every exit path.
+    struct InsnGuard {
+        cs_insn* p = nullptr;
+        size_t   n = 0;
+        ~InsnGuard() { if (p) cs_free(p, n); }
+    };
+
+    while (offset < code.size()) {
+        if (count != 0 && result.size() >= count) break;
+        size_t want = (count == 0) ? 0 : (count - result.size());
+
+        cs_insn* insn = nullptr;
+        size_t n = cs_disasm(static_cast<csh>(handle_), code.data() + offset,
+                             code.size() - offset, address + offset, want, &insn);
+        InsnGuard guard{insn, n};
+
+        for (size_t i = 0; i < n; ++i)
+            result.push_back(buildInstruction(insn[i], static_cast<csh>(handle_), arch_));
+
+        if (n > 0)
+            offset = (result.back().address - address) + result.back().size;
+
+        // Stop unless we should emit a "db" for the byte Capstone choked on.
+        if (!emitDataBytes) break;
+        if (count != 0 && result.size() >= count) break;
+        if (offset >= code.size()) break;
+
+        Instruction dbi;
+        dbi.address = address + offset;
+        dbi.size = 1;
+        dbi.bytes = {code[offset]};
+        dbi.mnemonic = "db";
+        char hb[8];
+        std::snprintf(hb, sizeof(hb), "0x%02x", code[offset]);
+        dbi.operands = hb;
+        result.push_back(std::move(dbi));
+        offset += 1;
+    }
+
+    return result;
+}
+
+uintptr_t Disassembler::previousInstruction(uintptr_t addr,
+    const std::function<bool(uintptr_t, uint8_t*, size_t)>& read) {
+    uintptr_t best = addr ? addr - 1 : addr;
+    for (int len = 15; len >= 1; --len) {
+        if (static_cast<uintptr_t>(len) > addr) continue;
+        uintptr_t cand = addr - len;
+        uint8_t buf[16];
+        if (!read(cand, buf, static_cast<size_t>(len))) continue;
+        auto insns = disassemble(cand, {buf, static_cast<size_t>(len)}, 1);
+        if (!insns.empty() && insns[0].size == static_cast<size_t>(len)) return cand;
+    }
+    return best;
+}
+
+std::optional<Instruction> Disassembler::disassembleOne(uintptr_t address, std::span<const uint8_t> code) {
+    auto result = disassemble(address, code, 1);
+    if (result.empty()) return std::nullopt;
+    return std::move(result[0]);
+}
+
+// Map an x86 register name (64-bit, or its 32-bit alias) to the CpuContext member
+// holding it. Addressing in 64-bit mode uses the full 64-bit registers; 32-bit
+// address-size truncation is not modelled (rare, and irrelevant to data watches).
+static uint64_t registerValueByName(const CpuContext& c, const std::string& name) {
+    static const std::unordered_map<std::string, uint64_t CpuContext::*> kRegs = {
+        {"rax",&CpuContext::rax},{"rbx",&CpuContext::rbx},{"rcx",&CpuContext::rcx},{"rdx",&CpuContext::rdx},
+        {"rsi",&CpuContext::rsi},{"rdi",&CpuContext::rdi},{"rbp",&CpuContext::rbp},{"rsp",&CpuContext::rsp},
+        {"r8",&CpuContext::r8},{"r9",&CpuContext::r9},{"r10",&CpuContext::r10},{"r11",&CpuContext::r11},
+        {"r12",&CpuContext::r12},{"r13",&CpuContext::r13},{"r14",&CpuContext::r14},{"r15",&CpuContext::r15},
+        {"rip",&CpuContext::rip},
+        {"eax",&CpuContext::rax},{"ebx",&CpuContext::rbx},{"ecx",&CpuContext::rcx},{"edx",&CpuContext::rdx},
+        {"esi",&CpuContext::rsi},{"edi",&CpuContext::rdi},{"ebp",&CpuContext::rbp},{"esp",&CpuContext::rsp},
+        {"r8d",&CpuContext::r8},{"r9d",&CpuContext::r9},{"r10d",&CpuContext::r10},{"r11d",&CpuContext::r11},
+        {"r12d",&CpuContext::r12},{"r13d",&CpuContext::r13},{"r14d",&CpuContext::r14},{"r15d",&CpuContext::r15},
+    };
+    auto it = kRegs.find(name);
+    return it == kRegs.end() ? 0 : c.*(it->second);
+}
+
+uintptr_t computeEffectiveAddress(const Instruction& inst, const CpuContext& ctx) {
+    if (!inst.memory.present) return 0;
+    if (inst.memory.ripRelative) return inst.ripTarget;  // pre-resolved
+    int64_t ea = inst.memory.disp;
+    if (!inst.memory.baseReg.empty())
+        ea += static_cast<int64_t>(registerValueByName(ctx, inst.memory.baseReg));
+    if (!inst.memory.indexReg.empty())
+        ea += static_cast<int64_t>(registerValueByName(ctx, inst.memory.indexReg)) * inst.memory.scale;
+    return static_cast<uintptr_t>(ea);
+}
+
+} // namespace ce

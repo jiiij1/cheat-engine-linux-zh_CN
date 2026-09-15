@@ -1,0 +1,78 @@
+// Headless (offscreen Qt) smoke test for the Memory Viewer's wildcard AOB search:
+// a "??" wildcard in the pattern matches any byte, an exact pattern does not.
+// Searches this process's own memory. Exit 0 on success.
+
+#include "gui/memorybrowser.hpp"
+#include "platform/linux/linux_process.hpp"
+
+#include <QApplication>
+#include <cstdio>
+#include <cstdint>
+#include <cstring>
+#include <vector>
+#include <unistd.h>
+
+// A distinctive 6-byte needle unlikely to occur elsewhere.
+static volatile uint8_t g_needle[6] = {0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE};
+
+int main(int argc, char** argv) {
+    qputenv("QT_QPA_PLATFORM", "offscreen");
+    QApplication app(argc, argv);
+
+    ce::os::LinuxProcessHandle proc(getpid());
+    ce::gui::MemoryBrowser browser(&proc);
+    const uintptr_t at = reinterpret_cast<uintptr_t>(const_cast<uint8_t*>(g_needle));
+
+    // Wildcard at index 1 (the 0xAD byte) still matches g_needle.
+    std::vector<uint8_t> wpat = {0xDE, 0x00, 0xBE, 0xEF, 0xCA, 0xFE};
+    std::vector<char>    wmask = {1, 0, 1, 1, 1, 1};
+    uintptr_t wildHit = browser.searchMemoryForTest(wpat, wmask, at);
+
+    // The same pattern as an EXACT match (byte 1 must be 0x00) must not match here.
+    std::vector<char> exactMask = {1, 1, 1, 1, 1, 1};
+    uintptr_t exactHit = browser.searchMemoryForTest(wpat, exactMask, at);
+
+    // A fully-exact correct pattern matches at the needle.
+    std::vector<uint8_t> full = {0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE};
+    uintptr_t fullHit = browser.searchMemoryForTest(full, exactMask, at);
+
+    // Backward search from just past the needle finds it (Find Previous); from the needle
+    // itself it must look strictly below, so it must NOT return the needle.
+    uintptr_t backHit = browser.searchMemoryForTest(full, exactMask, at + 6, /*backward=*/true);
+    uintptr_t backAtNeedle = browser.searchMemoryForTest(full, exactMask, at, /*backward=*/true);
+
+    // focusPane raises the requested pane (CE double-click routing: Shift/exec ->
+    // disassembler, Ctrl/data -> hex dump; the pure choice is unit-tested in cecore).
+    browser.focusPane(ce::gui::MemoryBrowser::Pane::HexDump);
+    bool hexFocused = browser.focusedPaneForTest() == ce::gui::MemoryBrowser::Pane::HexDump;
+    browser.focusPane(ce::gui::MemoryBrowser::Pane::Disassembler);
+    bool disasmFocused = browser.focusedPaneForTest() == ce::gui::MemoryBrowser::Pane::Disassembler;
+    bool paneOk = hexFocused && disasmFocused;
+
+    // Address bar shows the current location symbolically (CE): an address inside a
+    // mapped module reads as "module+offset"; an off-module address falls back to hex.
+    bool symBar = false;
+    for (const auto& m : proc.modules()) {
+        if (m.name.empty() || m.size == 0) continue;
+        QString t = browser.addressBarTextForTest(m.base);
+        if (t.contains("+0x") && !t.startsWith("0x")) { symBar = true; break; }
+    }
+    bool hexFallback = browser.addressBarTextForTest(0x1234).startsWith("0x");
+    bool addrBarOk = symBar && hexFallback;
+
+    // Tools menu (CE): "Auto Assemble..." and "Dissect data/structures..." route to the
+    // openers MainWindow wires; here we assert the actions exist and fire their hooks.
+    bool aaFired = false, dissectFired = false;
+    browser.setAutoAssembleOpener([&](const QString&) { aaFired = true; });
+    browser.setDissectOpener([&](uintptr_t) { dissectFired = true; });
+    bool toolsOk = browser.triggerToolActionForTest("Auto Assemble") && aaFired &&
+                   browser.triggerToolActionForTest("Dissect") && dissectFired;
+
+    bool ok = (wildHit == at) && (exactHit != at) && (fullHit == at) &&
+              (backHit == at) && (backAtNeedle != at) && paneOk && addrBarOk && toolsOk;
+    printf("gui search smoke: %s (wild@needle=%d exactMismatch=%d full@needle=%d "
+           "backFinds=%d backStrictlyBelow=%d paneFocus=%d addrBar=%d tools=%d)\n",
+           ok ? "OK" : "FAILED", (int)(wildHit == at), (int)(exactHit != at), (int)(fullHit == at),
+           (int)(backHit == at), (int)(backAtNeedle != at), (int)paneOk, (int)addrBarOk, (int)toolsOk);
+    return ok ? 0 : 1;
+}

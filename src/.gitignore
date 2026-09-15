@@ -1,0 +1,37 @@
+build/
+build-asan/
+
+# Kernel module build artifacts (out-of-tree build leaves these in kernel/)
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+.*.cmd
+*.symvers
+modules.order
+Module.symvers
+.tmp_versions/
+
+# Built shared / static libraries + AppImage output
+*.so
+*.a
+*.AppImage
+AppDir/
+
+# Local caches
+.cache/
+
+# Editor / tool / agent config (local, not project)
+.vscode/
+.claude/
+.codex/
+.opencode/
+
+# Compiled test target (source sample_game.c is tracked)
+/sample_game
+/ce-upstream-ref/
+
+# CE-derived generated layouts (regenerate with tools/lfm2qt from your own CE checkout)
+gui/generated/*.ui
+build-ci-asan/
